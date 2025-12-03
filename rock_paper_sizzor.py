@@ -1,674 +1,217 @@
-"""
-Local Markdown Chatbot (Copilot-style) — No APIs, No Internet
-Run:
-    python local_copilot.py
+import wx
+import random
+from cProfile import label
+import pyttsx3
+import pygame
+import time
+my_list = ['scizzor', 'paper', 'rock']
+turns=0
+computer_score=0
+player_score=0
+draw=0
+intro=0
+def music(path):
+    pygame.mixer.init()
+    pygame.mixer.music.load(path) 
+    pygame.mixer.music.play(-1)
 
-Features:
-- Copilot-like responses: concise, empathetic, structured Markdown (headings, lists, tables).
-- Math mode with LaTeX steps: "math: 2+3*4" or "math: solve 2x+3=11".
-- Compare/rank mode auto-creates tables: "compare: phones | price, battery, camera".
-- Explain/summarize mode: "explain: topic", "summarize: text here".
-- Brainstorm mode: "brainstorm: project idea about ...".
-- Safety guardrails: refuses harmful requests, medical/therapy advice.
-- Tiny offline knowledge shard (limited facts) for demos.
-
-Notes:
-- This is intentionally small and offline. It won't browse or cite sources.
-- Markdown tables/LaTeX render best in viewers that support them.
-"""
-
-import ast
-import operator
-import re
-import sys
-from typing import List, Dict, Tuple, Optional
-
-# -----------------------------
-# Persona and style settings
-# -----------------------------
-STYLE = {
-    "max_sections": 6,
-    "max_table_cols": 5,
-    "short_reply_threshold": 140,  # characters
-}
-
-# -----------------------------
-# Safety guardrails
-# -----------------------------
-HARMFUL_PATTERNS = [
-    r"suicide", r"kill myself", r"harm myself", r"self[-\s]?harm",
-    r"harm others", r"hurt someone", r"violence", r"bomb", r"weapon",
-    r"abuse", r"poison", r"overdose",
-]
-MEDICAL_PATTERNS = [
-    r"diagnose", r"symptom", r"treatment", r"medication", r"dose", r"therapy",
-    r"side effect", r"prescribe", r"prognosis",
-]
-
-def is_harmful(text: str) -> bool:
-    t = text.lower()
-    return any(re.search(p, t) for p in HARMFUL_PATTERNS)
-
-def is_medical(text: str) -> bool:
-    t = text.lower()
-    return any(re.search(p, t) for p in MEDICAL_PATTERNS)
-
-# -----------------------------
-# Tiny offline knowledge shard (demo only)
-# -----------------------------
-FACTS: Dict[str, str] = {
-    "best metal conductor of heat": "Silver has the highest thermal conductivity among common metals; copper is close.",
-    "diamond thermal conductivity": "Diamond (not a metal) has extremely high thermal conductivity.",
-    "ohm law": "Ohm’s law: V = I × R.",
-    "newton second law": "Newton’s second law: F = m × a.",
-    "python list": "A Python list is an ordered, mutable collection supporting indexing and slicing.",
-}
-
-def lookup_fact(q: str) -> Optional[str]:
-    q = q.lower().strip()
-    for k, v in FACTS.items():
-        if k in q:
-            return v
-    return None
-
-# -----------------------------
-# Markdown helpers
-# -----------------------------
-def h(level: int, text: str) -> str:
-    level = max(1, min(6, level))
-    return f"{'#' * level} {text}"
-
-def bullet(label: str, desc: str) -> str:
-    return f"- **{label}:** {desc}"
-
-def table(headers: List[str], rows: List[List[str]]) -> str:
-    if not headers:
-        return ""
-    headers = headers[:STYLE["max_table_cols"]]
-    out = ["| " + " | ".join(headers) + " |",
-           "| " + " | ".join(["---"] * len(headers)) + " |"]
-    for row in rows:
-        row = row[:len(headers)]
-        out.append("| " + " | ".join(row) + " |")
-    return "\n".join(out)
-
-# -----------------------------
-# Math engine (safe eval + simple solve)
-# -----------------------------
-ALLOWED_OPS = {
-    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-    ast.Div: operator.truediv, ast.Pow: operator.pow, ast.USub: operator.neg,
-    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
-}
-def safe_eval_expr(node):
-    if isinstance(node, ast.Num):
-        return node.n
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in ALLOWED_OPS:
-        return ALLOWED_OPS[type(node.op)](safe_eval_expr(node.left), safe_eval_expr(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in ALLOWED_OPS:
-        return ALLOWED_OPS[type(node.op)](safe_eval_expr(node.operand))
-    raise ValueError("Unsupported expression")
-
-def math_calculate(expr: str) -> Tuple[str, Optional[float]]:
-    try:
-        node = ast.parse(expr, mode='eval').body
-        val = safe_eval_expr(node)
-        steps = f"- **Expression:** \({expr}\)\n- **Result:** \({val}\)"
-        return steps, float(val)
-    except Exception:
-        return "- **Note:** I can only handle basic arithmetic (e.g., 2+3*4, (1+2)**3).", None
-
-def solve_linear(eq: str) -> str:
-    """
-    Solve ax + b = c for x. Supports forms like '2x+3=11', 'x-5=10', '3x=12'.
-    """
-    eq = eq.replace(" ", "")
-    if "=" not in eq:
-        return "- **Note:** Please provide an equation like 2x+3=11."
-    left, right = eq.split("=", 1)
-    # Extract coefficients from left: ax + b
-    # Handle cases: '2x+3', 'x-5', '3x'
-    m = re.match(r"^([+-]?\d*)x([+-]\d+)?$", left)
-    if not m:
-        return "- **Note:** I can only solve simple linear equations like 2x+3=11."
-    a_str, b_str = m.groups()
-    a = 1 if a_str in ("", "+") else (-1 if a_str == "-" else int(a_str))
-    b = int(b_str) if b_str else 0
-    try:
-        c = int(right)
-    except ValueError:
-        return "- **Note:** Right-hand side should be a number."
-    # Solve: ax + b = c => x = (c - b) / a
-    try:
-        x = (c - b) / a
-    except ZeroDivisionError:
-        return "- **Note:** Coefficient of x cannot be zero for a linear equation."
-    return "\n".join([
-        "- **Given:** \(" + eq.replace("^", "**") + "\)",
-        "- **Rearrange:** \(ax + b = c \Rightarrow x = \frac{c - b}{a}\)",
-        f"- **Compute:** \(\frac{{{c} - {b}}}{{{a}}} = {x}\)",
-        f"- **Solution:** \(x = {x}\)",
-    ])
-
-# -----------------------------
-# Intent detection
-# -----------------------------
-def detect_intent(text: str) -> str:
-    t = text.strip().lower()
-    if t.startswith("math:"):
-        return "math"
-    if t.startswith("compare:"):
-        return "compare"
-    if t.startswith("rank:"):
-        return "rank"
-    if t.startswith("explain:"):
-        return "explain"
-    if t.startswith("summarize:"):
-        return "summarize"
-    if t.startswith("brainstorm:"):
-        return "brainstorm"
-    return "chat"
-
-# -----------------------------
-# Compare/Rank helpers
-# -----------------------------
-def parse_compare_payload(t: str) -> Tuple[List[str], List[str]]:
-    """
-    Format: "compare: items a,b,c | attrs price,battery"
-    """
-    payload = t.split("compare:", 1)[-1].strip()
-    parts = [p.strip() for p in payload.split("|")]
-    items = parts[0] if parts else ""
-    attrs = parts[1] if len(parts) > 1 else ""
-    item_list = [x.strip() for x in items.split(",") if x.strip()]
-    attr_list = [x.strip() for x in attrs.split(",") if x.strip()]
-    return item_list, attr_list
-
-def rank_items(items: List[str]) -> List[str]:
-    # Placeholder ranking: alphabetical
-    return sorted(items, key=lambda s: s.lower())
-
-# -----------------------------
-# Response builders
-# -----------------------------
-def respond_chat(user: str) -> str:
-    if is_harmful(user):
-        return "\n".join([
-            h(3, "I can’t help with that"),
-            "I’m here to keep you safe and informed. I can’t assist with harming yourself or others.",
-            "If you want general information or a different topic, I’m here for that.",
-        ])
-    if is_medical(user):
-        return "\n".join([
-            h(3, "General guidance only"),
-            "I can share general information, but I can’t provide medical advice or diagnoses.",
-            "Consider speaking to a qualified professional for personalized support.",
-        ])
-    # Simple facts fallback
-    fact = lookup_fact(user)
-    if fact:
-        return "\n".join([
-            h(3, "Direct answer"),
-            fact,
-        ])
-    # Default conversational style
-    simple = len(user) < STYLE["short_reply_threshold"]
-    if simple:
-        return "Got it. Want a quick breakdown or a deeper dive?"
-    return "\n".join([
-        h(2, "Overview"),
-        "Here’s a concise, structured take tailored to your prompt.",
-        "",
-        h(3, "Key points"),
-        "\n".join([
-            bullet("Context", "I’m offline, so I’ll focus on reasoning and clarity."),
-            bullet("Assumptions", "I infer intent from your wording and keep answers concise."),
-            bullet("Next step", "Ask for a comparison, math, or a summary for more structure."),
-        ]),
-    ])
-
-def respond_math(user: str) -> str:
-    payload = user.split("math:", 1)[-1].strip()
-    if payload.startswith("solve"):
-        eq = payload.split("solve", 1)[-1].strip()
-        return "\n".join([h(2, "Linear equation solution"), solve_linear(eq)])
-    steps, val = math_calculate(payload)
-    return "\n".join([h(2, "Computation"), steps])
-
-def respond_explain(user: str) -> str:
-    topic = user.split("explain:", 1)[-1].strip() or "that topic"
-    return "\n".join([
-        h(2, f"Explainer: {topic}"),
-        h(3, "Core idea"),
-        "Think of it as a system with inputs, a transformation, and outputs—optimize the transformation.",
-        h(3, "Why it matters"),
-        "\n".join([
-            bullet("Clarity", "It reduces ambiguity and helps decisions."),
-            bullet("Speed", "Clear models shorten feedback loops."),
-            bullet("Reliability", "Explicit assumptions avoid hidden errors."),
-        ]),
-    ])
-
-def respond_summarize(user: str) -> str:
-    text = user.split("summarize:", 1)[-1].strip()
-    if not text:
-        return "\n".join([h(3, "I need the text"), "Paste the content after 'summarize:'"])
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    bullets = [bullet(f"Point {i+1}", s) for i, s in enumerate(sentences[:6])]
-    return "\n".join([h(2, "Summary"), "\n".join(bullets)])
-
-def respond_brainstorm(user: str) -> str:
-    topic = user.split("brainstorm:", 1)[-1].strip() or "your idea"
-    ideas = [
-        ("Lean pilot", "Ship a minimal core to validate demand quickly."),
-        ("Delight hooks", "Add one playful feature users talk about."),
-        ("Data loop", "Instrument usage to learn and iterate weekly."),
-        ("Partner angle", "Find a collaborator who amplifies reach."),
-    ]
-    rows = [[name, desc] for name, desc in ideas]
-    t = table(["Idea", "Why"], rows)
-    return "\n".join([h(2, f"Brainstorm: {topic}"), t])
-
-def respond_compare(user: str) -> str:
-    items, attrs = parse_compare_payload(user)
-    if not items or not attrs:
-        return "\n".join([
-            h(3, "I need items and attributes"),
-            "Format: compare: item1, item2 | price, battery, camera",
-        ])
-    rows = [[it] + ["—"] * len(attrs) for it in items]
-    t = table(["Item"] + attrs, rows)
-    return "\n".join([h(2, "Comparison"), t])
-
-def respond_rank(user: str) -> str:
-    items = [x.strip() for x in user.split("rank:", 1)[-1].split(",") if x.strip()]
-    if not items:
-        return "\n".join([h(3, "I need items"), "Format: rank: item1, item2, item3"])
-    ranked = rank_items(items)
-    rows = [[str(i+1), it] for i, it in enumerate(ranked)]
-    t = table(["Rank", "Item"], rows)
-    return "\n".join([h(2, "Ranking"), t])
-
-# -----------------------------
-# Main loop
-# -----------------------------
-HELP_TEXT = "\n".join([
-    h(2, "Commands"),
-    "\n".join([
-        bullet("Chat", "Just type your message."),
-        bullet("Math", "math: 2+3*4 or math: solve 2x+3=11"),
-        bullet("Explain", "explain: topic"),
-        bullet("Summarize", "summarize: paste text"),
-        bullet("Brainstorm", "brainstorm: your idea"),
-        bullet("Compare", "compare: a,b,c | price,battery"),
-        bullet("Rank", "rank: a, b, c"),
-        bullet("Quit", "/exit or Ctrl+C"),
-    ]),
-])
-
-def respond(user: str) -> str:
-    intent = detect_intent(user)
-    if intent == "math":
-        return respond_math(user)
-    if intent == "compare":
-        return respond_compare(user)
-    if intent == "rank":
-        return respond_rank(user)
-    if intent == "explain":
-        return respond_explain(user)
-    if intent == "summarize":
-        return respond_summarize(user)
-    if intent == "brainstorm":
-        return respond_brainstorm(user)
-    return respond_chat(user)
-
-def main():
-    print(h(1, "Local Copilot-style chatbot"))
-    print("Type /help for commands. No internet, no APIs.")
-    while True:
-        try:
-            user = input("> ").strip()
-        except KeyboardInterrupt:
-            print("\nGoodbye.")
-            break
-        if not user:
-            continue
-        if user.lower() in ("/exit", "exit", "quit"):
-            print("Goodbye.")
-            break
-        if user.lower() == "/help":
-            print(HELP_TEXT)
-            continue
-        print(respond(user))
+def voice(event,n):
+    engine = pyttsx3.init()
+    voices = engine.getProperty('voices')
+    engine.setProperty("voice",voices[n])
+    engine.say(event)
+    engine.runAndWait()
 
 
-import ast
-import operator
-import re
-import sys
-from typing import List, Dict, Tuple, Optional
+def on_start(event):
+    title.Destroy()
+    start_btn.Destroy()
+    intro1="Welcome, Challenger! 👋\n\nYou have stepped into the Arena of Three Powers — Rock, Paper, and Scissors.\nFor years, this arena has been guarded by the undefeated champion: Phantom Fist 👊🏾, \na super-intelligent bot built from millions of strategy simulations.\n\nPhantom Fist scans your moves, predicts your patterns, and adapts with\n lightning speed. ⚡\n"
+    intro = wx.StaticText(start_panel, label=intro1, pos=(25,180)) 
+    voice(intro1,0)
+    intro2 ="But today… it faces YOU.\n\nWill you outsmart the machine?  \nWill intuition defeat calculation?  \nOnly one way to find out.\n\nChoose your move — Rock 🪨, Paper 📄, or Scissors ✂️ — and let the duel begin!"
+    wx.CallLater(8000, intro.SetLabel, "But today… it faces YOU.\n\nWill you outsmart the machine?  \nWill intuition defeat calculation?  \nOnly one way to find out.\n\nChoose your move — Rock 🪨, Paper 📄, or Scissors ✂️ — and let the duel begin!")
+    voice(intro2,1)
+    intro.SetForegroundColour("#0a3b0c")
+    next_btn=wx.Button(start_panel, label="Next", pos=(350, 450),size=(100,30))
+    
+    next_btn.SetBackgroundColour("#bac095")
+    next_btn.Bind(wx.EVT_BUTTON, start_game)
 
-# -----------------------------
-# Persona and style settings
-# -----------------------------
-STYLE = {
-    "max_sections": 6,
-    "max_table_cols": 5,
-    "short_reply_threshold": 140,  # characters
-}
+def start_game(event):
+    start_panel.Hide()
+    panel1.Show()
 
-# -----------------------------
-# Safety guardrails
-# -----------------------------
-HARMFUL_PATTERNS = [
-    r"suicide", r"kill myself", r"harm myself", r"self[-\s]?harm",
-    r"harm others", r"hurt someone", r"violence", r"bomb", r"weapon",
-    r"abuse", r"poison", r"overdose",
-]
-MEDICAL_PATTERNS = [
-    r"diagnose", r"symptom", r"treatment", r"medication", r"dose", r"therapy",
-    r"side effect", r"prescribe", r"prognosis",
-]
+def rules(event):
+    wx.MessageBox("Winning rules:\n. Rock smashes scissors\n. Scissors cuts paper\n. Paper covers rock", "Rules")
 
-def is_harmful(text: str) -> bool:
-    t = text.lower()
-    return any(re.search(p, t) for p in HARMFUL_PATTERNS)
+def on_clickr(event):
+    global turns, computer_score, player_score, draw
+    player_name = name_input.GetValue() or "Player"
+    turns_max = turns_input.GetValue()
+    if turns < int(turns_max) and int(turns_max)>0:
+        rand = random.choice(my_list)
+        if rand == 'rock':
+            a = "Aww, It was a tie :)"
+            draw += 1
+        elif rand == 'paper':
+            a = "Phantom Fist won :("
+            computer_score += 1
+        else:
+            a = "Congratulations you won!! :)"
+            player_score += 1
+        message = f"{player_name}'s Choice: Rock             Phantom Fist Choice: {rand}\n\n{a}"
+        label.SetLabel(message)
+        turns += 1
+        name_input.Disable()
+        turns_input.Disable()
+    else:
+        end_game(player_name)
 
-def is_medical(text: str) -> bool:
-    t = text.lower()
-    return any(re.search(p, t) for p in MEDICAL_PATTERNS)
+def on_clickp(event):
+    global turns, computer_score, player_score, draw
+    player_name = name_input.GetValue() or "Player"
+    turns_max = turns_input.GetValue()
+    if turns < int(turns_max) and int(turns_max)>0:
+        rand = random.choice(my_list)
+        if rand == 'rock':
+            a = "Congratulations you won!! :)"
+            player_score += 1
+        elif rand == 'paper':
+            a = "Aww, It was a tie"
+            draw += 1
+        else:
+            a = "Phantom Fist won :("
+            computer_score += 1
+        message = f"{player_name}'s Choice: Paper             Phantom Fist Choice: {rand}\n\n{a}"
+        label.SetLabel(message)
+        turns += 1
+        name_input.Disable()
+        turns_input.Disable()
+    else:
+        end_game(player_name)
 
-# -----------------------------
-# Tiny offline knowledge shard (demo only)
-# -----------------------------
-FACTS: Dict[str, str] = {
-    "best metal conductor of heat": "Silver has the highest thermal conductivity among common metals; copper is close.",
-    "diamond thermal conductivity": "Diamond (not a metal) has extremely high thermal conductivity.",
-    "ohm law": "Ohm’s law: V = I × R.",
-    "newton second law": "Newton’s second law: F = m × a.",
-    "python list": "A Python list is an ordered, mutable collection supporting indexing and slicing.",
-}
+def on_clicks(event):
+    global turns, computer_score, player_score, draw
+    player_name = name_input.GetValue() or "Player"
+    turns_max = turns_input.GetValue()
+    if turns < int(turns_max) and int(turns_max)>0:
+        rand = random.choice(my_list)
+        if rand == 'rock':
+            a = "Phantom Fist won :("
+            computer_score += 1
+        elif rand == 'paper':
+            a = "Congratulations you won!! :)"
+            player_score += 1
+        else:
+            a = "Aww, It was tie"
+            draw += 1
+        message = f"{player_name}'s Choice: Scizzor             Phantom Fist Choice: {rand}\n\n{a}"
+        label.SetLabel(message)
+        turns += 1
+        name_input.Disable()
+        turns_input.Disable()
+    else:
+        end_game(player_name)
 
-def lookup_fact(q: str) -> Optional[str]:
-    q = q.lower().strip()
-    for k, v in FACTS.items():
-        if k in q:
-            return v
-    return None
+def end_game(player_name):
+    global turns, computer_score, player_score, draw
+    rockbtn.Disable()
+    paperbtn.Disable()
+    scizzorbtn.Disable()
+    score = f"Game Over!\n\nFinal Scores:\n{player_name}: {player_score}\nComputer: {computer_score}\nDraws: {draw}"
+    Score.SetLabel(score)
+    # Play celebratory music when scoreboard appears
+    music("C:\\Users\\kanna\\Downloads\\Ramana Aei Guntur Kaaram 320 Kbps.mp3")
+    play_againbtn = wx.Button(panel1, label="Play Again", pos=(200, 520))
+    play_againbtn.SetBackgroundColour("#ffd3ac")
+    exitbtn = wx.Button(panel1, label="Exit", pos=(320, 520))
+    exitbtn.SetBackgroundColour("#ffd3ac")
+    play_againbtn.Bind(wx.EVT_BUTTON, on_play_again)
+    play_againbtn.SetBackgroundColour("#bac095")
+    exitbtn.Bind(wx.EVT_BUTTON, on_exit)
+    exitbtn.SetBackgroundColour("#bac095")
 
-# -----------------------------
-# Markdown helpers
-# -----------------------------
-def h(level: int, text: str) -> str:
-    level = max(1, min(6, level))
-    return f"{'#' * level} {text}"
+    if player_score==computer_score:
+        wx.MessageBox("This Game was a TIE", "")
+    elif player_score>computer_score:
+        wx.MessageBox("You Won 🎉🎈", "Winner\n You shall claim the role of Phantom Fist and protect the 9 realms")
+    else:
+        wx.MessageBox("You lost ☠", "Loser")
 
-def bullet(label: str, desc: str) -> str:
-    return f"- **{label}:** {desc}"
+def on_play_again(event):
+    global turns, computer_score, player_score, draw
+    turns = 0
+    computer_score = 0
+    player_score = 0
+    draw = 0
+    label.SetLabel("Start playing")
+    Score.SetLabel("")
+    rockbtn.Enable()
+    paperbtn.Enable()
+    scizzorbtn.Enable()
+    turns_input.Enable()
 
-def table(headers: List[str], rows: List[List[str]]) -> str:
-    if not headers:
-        return ""
-    headers = headers[:STYLE["max_table_cols"]]
-    out = ["| " + " | ".join(headers) + " |",
-           "| " + " | ".join(["---"] * len(headers)) + " |"]
-    for row in rows:
-        row = row[:len(headers)]
-        out.append("| " + " | ".join(row) + " |")
-    return "\n".join(out)
+def on_exit(event):
+    frame.Close()
 
-# -----------------------------
-# Math engine (safe eval + simple solve)
-# -----------------------------
-ALLOWED_OPS = {
-    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
-    ast.Div: operator.truediv, ast.Pow: operator.pow, ast.USub: operator.neg,
-    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod,
-}
-def safe_eval_expr(node):
-    if isinstance(node, ast.Num):
-        return node.n
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in ALLOWED_OPS:
-        return ALLOWED_OPS[type(node.op)](safe_eval_expr(node.left), safe_eval_expr(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in ALLOWED_OPS:
-        return ALLOWED_OPS[type(node.op)](safe_eval_expr(node.operand))
-    raise ValueError("Unsupported expression")
+app = wx.App()
+frame = wx.Frame(None, title="Rock Paper Scizzor Game", size=(519, 642))
 
-def math_calculate(expr: str) -> Tuple[str, Optional[float]]:
-    try:
-        node = ast.parse(expr, mode='eval').body
-        val = safe_eval_expr(node)
-        steps = f"- **Expression:** \({expr}\)\n- **Result:** \({val}\)"
-        return steps, float(val)
-    except Exception:
-        return "- **Note:** I can only handle basic arithmetic (e.g., 2+3*4, (1+2)**3).", None
+start_panel = wx.Panel(frame, size=(500,600), pos=(0,0))
+start_panel.SetBackgroundColour("#cfda8d")
+title = wx.StaticText(start_panel, label="Rock Paper Scizzor", pos=(120,180))
+title.SetFont(wx.Font(22, wx.FONTFAMILY_SWISS, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+title.SetForegroundColour("#0a3b0c")
+start_btn = wx.Button(start_panel, label="Start Game", pos=(190,260), size=(120,40))
+start_btn.SetBackgroundColour("#bac095")
+start_btn.Bind(wx.EVT_BUTTON, on_start)
+rules_btn = wx.Button(start_panel, label="Rules", pos=(380,500))
+rules_btn.SetBackgroundColour("#bac095")
+rules_btn.Bind(wx.EVT_BUTTON, rules)
 
-def solve_linear(eq: str) -> str:
-    """
-    Solve ax + b = c for x. Supports forms like '2x+3=11', 'x-5=10', '3x=12'.
-    """
-    eq = eq.replace(" ", "")
-    if "=" not in eq:
-        return "- **Note:** Please provide an equation like 2x+3=11."
-    left, right = eq.split("=", 1)
-    # Extract coefficients from left: ax + b
-    # Handle cases: '2x+3', 'x-5', '3x'
-    m = re.match(r"^([+-]?\d*)x([+-]\d+)?$", left)
-    if not m:
-        return "- **Note:** I can only solve simple linear equations like 2x+3=11."
-    a_str, b_str = m.groups()
-    a = 1 if a_str in ("", "+") else (-1 if a_str == "-" else int(a_str))
-    b = int(b_str) if b_str else 0
-    try:
-        c = int(right)
-    except ValueError:
-        return "- **Note:** Right-hand side should be a number."
-    # Solve: ax + b = c => x = (c - b) / a
-    try:
-        x = (c - b) / a
-    except ZeroDivisionError:
-        return "- **Note:** Coefficient of x cannot be zero for a linear equation."
-    return "\n".join([
-        "- **Given:** \(" + eq.replace("^", "**") + "\)",
-        "- **Rearrange:** \(ax + b = c \Rightarrow x = \frac{c - b}{a}\)",
-        f"- **Compute:** \(\frac{{{c} - {b}}}{{{a}}} = {x}\)",
-        f"- **Solution:** \(x = {x}\)",
-    ])
+panel1 = wx.Panel(frame, size=(500, 600))
+panel1.SetBackgroundColour("#d4de95")
 
-# -----------------------------
-# Intent detection
-# -----------------------------
-def detect_intent(text: str) -> str:
-    t = text.strip().lower()
-    if t.startswith("math:"):
-        return "math"
-    if t.startswith("compare:"):
-        return "compare"
-    if t.startswith("rank:"):
-        return "rank"
-    if t.startswith("explain:"):
-        return "explain"
-    if t.startswith("summarize:"):
-        return "summarize"
-    if t.startswith("brainstorm:"):
-        return "brainstorm"
-    return "chat"
+panel2 = wx.Panel(frame, size=(500, 13), pos=(0, 0))
+panel2.SetBackgroundColour("#636b2f")
 
-# -----------------------------
-# Compare/Rank helpers
-# -----------------------------
-def parse_compare_payload(t: str) -> Tuple[List[str], List[str]]:
-    """
-    Format: "compare: items a,b,c | attrs price,battery"
-    """
-    payload = t.split("compare:", 1)[-1].strip()
-    parts = [p.strip() for p in payload.split("|")]
-    items = parts[0] if parts else ""
-    attrs = parts[1] if len(parts) > 1 else ""
-    item_list = [x.strip() for x in items.split(",") if x.strip()]
-    attr_list = [x.strip() for x in attrs.split(",") if x.strip()]
-    return item_list, attr_list
+panel3 = wx.Panel(frame, size=(500, 13), pos=(0, 590))
+panel3.SetBackgroundColour("#636b2f")
 
-def rank_items(items: List[str]) -> List[str]:
-    # Placeholder ranking: alphabetical
-    return sorted(items, key=lambda s: s.lower())
+panel4 = wx.Panel(frame, size=(13, 600), pos=(0, 0))
+panel4.SetBackgroundColour("#636b2f")   
 
-# -----------------------------
-# Response builders
-# -----------------------------
-def respond_chat(user: str) -> str:
-    if is_harmful(user):
-        return "\n".join([
-            h(3, "I can’t help with that"),
-            "I’m here to keep you safe and informed. I can’t assist with harming yourself or others.",
-            "If you want general information or a different topic, I’m here for that.",
-        ])
-    if is_medical(user):
-        return "\n".join([
-            h(3, "General guidance only"),
-            "I can share general information, but I can’t provide medical advice or diagnoses.",
-            "Consider speaking to a qualified professional for personalized support.",
-        ])
-    # Simple facts fallback
-    fact = lookup_fact(user)
-    if fact:
-        return "\n".join([
-            h(3, "Direct answer"),
-            fact,
-        ])
-    # Default conversational style
-    simple = len(user) < STYLE["short_reply_threshold"]
-    if simple:
-        return "Got it. Want a quick breakdown or a deeper dive?"
-    return "\n".join([
-        h(2, "Overview"),
-        "Here’s a concise, structured take tailored to your prompt.",
-        "",
-        h(3, "Key points"),
-        "\n".join([
-            bullet("Context", "I’m offline, so I’ll focus on reasoning and clarity."),
-            bullet("Assumptions", "I infer intent from your wording and keep answers concise."),
-            bullet("Next step", "Ask for a comparison, math, or a summary for more structure."),
-        ]),
-    ])
+panel5 = wx.Panel(frame, size=(13, 600), pos=(490, 0))
+panel5.SetBackgroundColour("#636b2f")
 
-def respond_math(user: str) -> str:
-    payload = user.split("math:", 1)[-1].strip()
-    if payload.startswith("solve"):
-        eq = payload.split("solve", 1)[-1].strip()
-        return "\n".join([h(2, "Linear equation solution"), solve_linear(eq)])
-    steps, val = math_calculate(payload)
-    return "\n".join([h(2, "Computation"), steps])
+panel1.Hide()
 
-def respond_explain(user: str) -> str:
-    topic = user.split("explain:", 1)[-1].strip() or "that topic"
-    return "\n".join([
-        h(2, f"Explainer: {topic}"),
-        h(3, "Core idea"),
-        "Think of it as a system with inputs, a transformation, and outputs—optimize the transformation.",
-        h(3, "Why it matters"),
-        "\n".join([
-            bullet("Clarity", "It reduces ambiguity and helps decisions."),
-            bullet("Speed", "Clear models shorten feedback loops."),
-            bullet("Reliability", "Explicit assumptions avoid hidden errors."),
-        ]),
-    ])
+name_label = wx.StaticText(panel1, label="Enter Your Name:", pos=(50, 30))
+name_input = wx.TextCtrl(panel1, pos=(50, 60), size=(200, 25))
+name_input.SetBackgroundColour("#bac095")
 
-def respond_summarize(user: str) -> str:
-    text = user.split("summarize:", 1)[-1].strip()
-    if not text:
-        return "\n".join([h(3, "I need the text"), "Paste the content after 'summarize:'"])
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    bullets = [bullet(f"Point {i+1}", s) for i, s in enumerate(sentences[:6])]
-    return "\n".join([h(2, "Summary"), "\n".join(bullets)])
+turns_label = wx.StaticText(panel1, label="Enter Number of Turns:", pos=(50, 100))
+turns_input = wx.TextCtrl(panel1, pos=(50, 130), size=(200, 25))
+turns_input.SetBackgroundColour("#bac095")
 
-def respond_brainstorm(user: str) -> str:
-    topic = user.split("brainstorm:", 1)[-1].strip() or "your idea"
-    ideas = [
-        ("Lean pilot", "Ship a minimal core to validate demand quickly."),
-        ("Delight hooks", "Add one playful feature users talk about."),
-        ("Data loop", "Instrument usage to learn and iterate weekly."),
-        ("Partner angle", "Find a collaborator who amplifies reach."),
-    ]
-    rows = [[name, desc] for name, desc in ideas]
-    t = table(["Idea", "Why"], rows)
-    return "\n".join([h(2, f"Brainstorm: {topic}"), t])
+rockbtn = wx.Button(panel1, label="Rock", pos=(50, 190),size=(100,30))
+rockbtn.SetBackgroundColour("#755E34C1")
+paperbtn = wx.Button(panel1, label="Paper", pos=(200, 190),size=(100,30))
+paperbtn.SetBackgroundColour("#dadfbc")
+scizzorbtn = wx.Button(panel1, label="Scizzor", pos=(350, 190),size=(100,30))
+scizzorbtn.SetBackgroundColour("#8491ac")
+seperator = wx.StaticText(panel1, label="---------------------------------------------------------------------------------------------", pos=(14, 250))
 
-def respond_compare(user: str) -> str:
-    items, attrs = parse_compare_payload(user)
-    if not items or not attrs:
-        return "\n".join([
-            h(3, "I need items and attributes"),
-            "Format: compare: item1, item2 | price, battery, camera",
-        ])
-    rows = [[it] + ["—"] * len(attrs) for it in items]
-    t = table(["Item"] + attrs, rows)
-    return "\n".join([h(2, "Comparison"), t])
+label = wx.StaticText(panel1, label="Start playing", pos=(50, 280))
 
-def respond_rank(user: str) -> str:
-    items = [x.strip() for x in user.split("rank:", 1)[-1].split(",") if x.strip()]
-    if not items:
-        return "\n".join([h(3, "I need items"), "Format: rank: item1, item2, item3"])
-    ranked = rank_items(items)
-    rows = [[str(i+1), it] for i, it in enumerate(ranked)]
-    t = table(["Rank", "Item"], rows)
-    return "\n".join([h(2, "Ranking"), t])
+seperator = wx.StaticText(panel1, label="---------------------------------------------------------------------------------------------", pos=(14, 350))
+rockbtn.Bind(wx.EVT_BUTTON, on_clickr)
+paperbtn.Bind(wx.EVT_BUTTON, on_clickp)
+scizzorbtn.Bind(wx.EVT_BUTTON, on_clicks)
 
-# -----------------------------
-# Main loop
-# -----------------------------
-HELP_TEXT = "\n".join([
-    h(2, "Commands"),
-    "\n".join([
-        bullet("Chat", "Just type your message."),
-        bullet("Math", "math: 2+3*4 or math: solve 2x+3=11"),
-        bullet("Explain", "explain: topic"),
-        bullet("Summarize", "summarize: paste text"),
-        bullet("Brainstorm", "brainstorm: your idea"),
-        bullet("Compare", "compare: a,b,c | price,battery"),
-        bullet("Rank", "rank: a, b, c"),
-        bullet("Quit", "/exit or Ctrl+C"),
-    ]),
-])
-
-def respond(user: str) -> str:
-    intent = detect_intent(user)
-    if intent == "math":
-        return respond_math(user)
-    if intent == "compare":
-        return respond_compare(user)
-    if intent == "rank":
-        return respond_rank(user)
-    if intent == "explain":
-        return respond_explain(user)
-    if intent == "summarize":
-        return respond_summarize(user)
-    if intent == "brainstorm":
-        return respond_brainstorm(user)
-    return respond_chat(user)
-
-def main():
-    print(h(1, "Local Copilot-style chatbot"))
-    print("Type /help for commands. No internet, no APIs.")
-    while True:
-        try:
-            user = input("> ").strip()
-        except KeyboardInterrupt:
-            print("\nGoodbye.")
-            break
-        if not user:
-            continue
-        if user.lower() in ("/exit", "exit", "quit"):
-            print("Goodbye.")
-            break
-        if user.lower() == "/help":
-            print(HELP_TEXT)
-            continue
-        print(respond(user))
-
-if __name__ == "__main__":
-    main()
+Scorei = wx.StaticText(panel1, label="                                              S C O R E   B O A R D \n                                             -----------------------", pos=(50, 370))
+Score = wx.StaticText(panel1, label="", pos=(50, 400))
+music("C:\Users\kanna\Downloads\Ramana Aei Guntur Kaaram 320 Kbps.mp3")
+frame.Show()
+app.MainLoop()
