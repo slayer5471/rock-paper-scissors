@@ -30,7 +30,7 @@ def on_start(event):
     intro = wx.StaticText(start_panel, label=intro1, pos=(25,180)) 
     voice(intro1,0)
     intro2 ="But today… it faces YOU.\n\nWill you outsmart the machine?  \nWill intuition defeat calculation?  \nOnly one way to find out.\n\nChoose your move — Rock 🪨, Paper 📄, or Scissors ✂️ — and let the duel begin!"
-    wx.CallLater(8000, intro.SetLabel, "But today… it faces YOU.\n\nWill you outsmart the machine?  \nWill intuition defeat calculation?  \nOnly one way to find out.\n\nChoose your move — Rock 🪨, Paper 📄, or Scissors ✂️ — and let the duel begin!")
+    wx.CallLater(10000, intro.SetLabel, "But today… it faces YOU.\n\nWill you outsmart the machine?  \nWill intuition defeat calculation?  \nOnly one way to find out.\n\nChoose your move — Rock 🪨, Paper 📄, or Scissors ✂️ — and let the duel begin!")
     voice(intro2,1)
     intro.SetForegroundColour("#0a3b0c")
     next_btn=wx.Button(start_panel, label="Next", pos=(350, 450),size=(100,30))
@@ -215,3 +215,4 @@ Score = wx.StaticText(panel1, label="", pos=(50, 400))
 music("C:\Users\kanna\Downloads\Ramana Aei Guntur Kaaram 320 Kbps.mp3")
 frame.Show()
 app.MainLoop()
+
